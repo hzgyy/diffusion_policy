@@ -257,3 +257,124 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
         return loss
+
+
+class SteerableDiffusionUnetImagePolicy(DiffusionUnetImagePolicy):
+    # ========= inference  ============
+    def conditional_sample(self, 
+            condition_data, condition_mask,
+            local_cond=None, global_cond=None,
+            generator=None,
+            initial_noise = None,
+            # keyword arguments to scheduler.step
+            **kwargs
+            ):
+        model = self.model
+        scheduler = self.noise_scheduler
+
+        if initial_noise is None:
+            trajectory = torch.randn(
+                size=condition_data.shape, 
+                dtype=condition_data.dtype,
+                device=condition_data.device,
+                generator=generator)
+        else:
+            if initial_noise.shape != condition_data.shape:
+                raise ValueError(f"Initial noise shape {initial_noise.shape} does not match condition data shape {condition_data.shape}")
+            trajectory = initial_noise.to(device=condition_data.device, dtype=condition_data.dtype)
+    
+        # set step values
+        scheduler.set_timesteps(self.num_inference_steps)
+
+        for t in scheduler.timesteps:
+            # 1. apply conditioning
+            trajectory[condition_mask] = condition_data[condition_mask]
+
+            # 2. predict model output
+            model_output = model(trajectory, t, 
+                local_cond=local_cond, global_cond=global_cond)
+
+            # 3. compute previous image: x_t -> x_t-1
+            trajectory = scheduler.step(
+                model_output, t, trajectory, 
+                generator=generator,
+                **kwargs
+                ).prev_sample
+        
+        # finally make sure conditioning is enforced
+        trajectory[condition_mask] = condition_data[condition_mask]        
+
+        return trajectory
+
+    def predict_action_with_noise(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        initial_noise: torch.Tensor
+        ) -> Dict[str, torch.Tensor]:
+        return self.predict_action(obs_dict, initial_noise=initial_noise)
+
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor],initial_noise: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+        """
+        obs_dict: must include "obs" key
+        result: must include "action" key
+        """
+        assert 'past_action' not in obs_dict # not implemented yet
+        # normalize input
+        nobs = self.normalizer.normalize(obs_dict)
+        value = next(iter(nobs.values()))
+        B, To = value.shape[:2]
+        T = self.horizon
+        Da = self.action_dim
+        Do = self.obs_feature_dim
+        To = self.n_obs_steps
+
+        # build input
+        device = self.device
+        dtype = self.dtype
+
+        # handle different ways of passing observation
+        local_cond = None
+        global_cond = None
+        if self.obs_as_global_cond:
+            # condition through global feature
+            this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
+            nobs_features = self.obs_encoder(this_nobs)
+            # reshape back to B, Do
+            global_cond = nobs_features.reshape(B, -1)
+            # empty data for action
+            cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
+            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
+        else:
+            # condition through impainting
+            this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
+            nobs_features = self.obs_encoder(this_nobs)
+            # reshape back to B, T, Do
+            nobs_features = nobs_features.reshape(B, To, -1)
+            cond_data = torch.zeros(size=(B, T, Da+Do), device=device, dtype=dtype)
+            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
+            cond_data[:,:To,Da:] = nobs_features
+            cond_mask[:,:To,Da:] = True
+
+        # run sampling
+        nsample = self.conditional_sample(
+            cond_data, 
+            cond_mask,
+            local_cond=local_cond,
+            global_cond=global_cond,
+            initial_noise=initial_noise,
+            **self.kwargs)
+        
+        # unnormalize prediction
+        naction_pred = nsample[...,:Da]
+        action_pred = self.normalizer['action'].unnormalize(naction_pred)
+
+        # get action
+        start = To - 1
+        end = start + self.n_action_steps
+        action = action_pred[:,start:end]
+        
+        result = {
+            'action': action,
+            'action_pred': action_pred
+        }
+        return result
